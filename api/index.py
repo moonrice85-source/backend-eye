@@ -85,7 +85,7 @@ Tingkat Keyakinan (Confidence): {nilai_confidence}
 Berikan penjelasan mendalam mengenai penyakit tersebut, tanda-tandanya pada citra fundus berdasarkan referensi, dan berikan rekomendasi tindakan medis awal yang harus dilakukan pasien."""
 
         payload_groq = {
-            "model": "llama3-8b-8192",
+            "model": "llama-3.1-8b-instant",  
             "messages": [{"role": "user", "content": prompt_teks}],
             "temperature": 0.2
         }
@@ -135,7 +135,7 @@ def test_katarak():
 Berikan penjelasan singkat mengenai penyakit Katarak dan rekomendasi tindakan medis awal berdasarkan referensi berikut:\n{konteks_teks}"""
 
         payload_groq = {
-            "model": "llama3-8b-8192",
+            "model": "llama-3.1-8b-instant",  
             "messages": [{"role": "user", "content": prompt_teks}],
             "temperature": 0.2
         }
