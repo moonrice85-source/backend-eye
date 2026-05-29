@@ -105,3 +105,72 @@ Berikan penjelasan mendalam mengenai penyakit tersebut, tanda-tandanya pada citr
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({"status": "active", "message": "Server RAG Vercel (Lightweight Mode) Aktif."})
+
+@app.route('/test-katarak', methods=['GET'])
+def test_katarak():
+    try:
+        # Simulasi input data seolah-olah dikirim dari Android/YOLO
+        nama_penyakit = "Katarak"
+        nilai_confidence = "95.00%"
+
+        # 1. GENERATE EMBEDDING VIA HUGGING FACE API
+        hf_url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+        headers_hf = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        res_embedding = requests.post(hf_url, headers=headers_hf, json={"inputs": nama_penyakit})
+        
+        if res_embedding.status_code == 200:
+            vektor_query = res_embedding.json()
+        else:
+            vektor_query = [0.0] * 384
+
+        # 2. QUERY KE PINECONE VIA REST API
+        url_pinecone = f"{PINECONE_HOST}/query"
+        headers_pc = {
+            "Api-Key": PINECONE_API_KEY,
+            "Content-Type": "application/json"
+        }
+        payload_pc = {
+            "vector": vektor_query,
+            "topK": 2,
+            "includeMetadata": True
+        }
+        res_pc = requests.post(url_pinecone, headers=headers_pc, json=payload_pc)
+        data_pc = res_pc.json()
+        
+        konteks_list = []
+        if "matches" in data_pc:
+            for match in data_pc["matches"]:
+                if "metadata" in match and "text" in match["metadata"]:
+                    konteks_list.append(match["metadata"]["text"])
+        konteks_teks = "\n\n".join(konteks_list) if konteks_list else "Katarak adalah kekeruhan pada lensa mata."
+
+        # 3. GENERATE TEXT VIA GROQ CLOUD API
+        url_groq = "https://api.groq.com/openai/v1/chat/completions"
+        headers_groq = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        prompt_teks = f"""Anda adalah seorang AI Asisten Dokter Spesialis Mata yang sangat profesional.
+Berikan penjelasan mendalam mengenai penyakit Katarak, tanda-tandanya pada mata, dan berikan rekomendasi tindakan medis awal berdasarkan dokumen referensi berikut:
+{konteks_teks}"""
+
+        payload_groq = {
+            "model": "llama3-8b-8192",
+            "messages": [{"role": "user", "content": prompt_teks}],
+            "temperature": 0.2
+        }
+        
+        res_groq = requests.post(url_groq, headers=headers_groq, json=payload_groq)
+        data_groq = res_groq.json()
+        hasil_interpretasi = data_groq['choices'][0]['message']['content']
+
+        # Kembalikan hasil ke browser
+        return jsonify({
+            "status": "success",
+            "uji_penyakit": nama_penyakit,
+            "respon_llm_groq": hasil_interpretasi
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
