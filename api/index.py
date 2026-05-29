@@ -100,7 +100,16 @@ Berikan penjelasan mendalam mengenai penyakit tersebut, tanda-tandanya pada citr
         }), 200
         
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        # Menampilkan detail eror dan isi respons mentah dari API luar jika ada
+        error_msg = str(e)
+        
+        # Coba cek apakah variabel data_groq sempat terbuat untuk melihat isi eror dari Groq
+        if 'data_groq' in locals():
+            error_msg += f" | Detail Groq: {data_groq}"
+        elif 'data_pc' in locals():
+            error_msg += f" | Detail Pinecone: {data_pc}"
+            
+        return jsonify({"status": "error", "message": error_msg}), 500
 
 # ==========================================
 # 2. ENDPOINT UJI COBA VIA BROWSER (GET)
@@ -142,8 +151,16 @@ Berikan penjelasan singkat mengenai penyakit Katarak dan rekomendasi tindakan me
         }), 200
         
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
+        # Menampilkan detail eror dan isi respons mentah dari API luar jika ada
+        error_msg = str(e)
+        
+        # Coba cek apakah variabel data_groq sempat terbuat untuk melihat isi eror dari Groq
+        if 'data_groq' in locals():
+            error_msg += f" | Detail Groq: {data_groq}"
+        elif 'data_pc' in locals():
+            error_msg += f" | Detail Pinecone: {data_pc}"
+            
+        return jsonify({"status": "error", "message": error_msg}), 500
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({"status": "active", "message": "Server RAG Vercel (Ultra-Lightweight REST API) Aktif."})
