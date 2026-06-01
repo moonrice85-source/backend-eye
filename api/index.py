@@ -59,64 +59,74 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
 
     try:
         # =========================================================================
-        # TAMBAHAN TRICK: QUERY EXPANSION DENGAN GROQ SEBELUM KE PINECONE
+        # STRATEGI BARU: AMBIL 1 NAMA MEDIS UTAMA & KATA KUNCI PENCARIAN SEPARASI
         # =========================================================================
-        # Hal ini mematangkan query agar memuat nama Medis (Latin/Inggris) sekaligus nama Awam (Indonesia)
         url_groq = "https://api.groq.com/openai/v1/chat/completions"
         headers_groq = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json"
         }
         
-        prompt_sinonim = f"""
-        Tugas Anda adalah memberikan padanan nama penyakit mata dalam bentuk (Istilah Awam Indonesia dan Istilah Medis/Latin/Inggris).
-        Jangan berikan penjelasan panjang atau tanda baca, cukup berikan 2 sampai 3 kata kunci utama saja.
+        # Prompt ini memaksa Groq hanya memberikan SATU istilah medis utama untuk filter ketat
+        prompt_medis_murni = f"""
+        Sebutkan HANYA SATU nama istilah medis/ilmiah resmi (dalam bahasa Inggris atau Latin) untuk penyakit mata berikut: {clean_disease}.
+        Jangan berikan tanda baca, jangan ada kata lain, cukup nama penyakitnya saja.
         
         Contoh:
-        Input: hordeolum -> Output: bintitan hordeolum stye
-        Input: bintitan -> Output: bintitan hordeolum stye
-        Input: cataract -> Output: katarak cataract
-        Input: mata merah -> Output: mata merah konjungtivitis conjunctivitis
+        Input: bintitan -> Output: hordeolum
+        Input: mata merah -> Output: conjunctivitis
+        Input: katarak -> Output: cataract
         
         Input: {clean_disease}
         Output:"""
         
-        payload_sinonim = {
+        payload_medis = {
             "model": "llama-3.1-8b-instant",
-            "messages": [{"role": "user", "content": prompt_sinonim}],
+            "messages": [{"role": "user", "content": prompt_medis_murni}],
             "temperature": 0.1
         }
         
-        # Eksekusiasan perluasan kata kunci secara senyap (silent)
         try:
-            res_sinonim = requests.post(url_groq, headers=headers_groq, json=payload_sinonim)
-            keyword_diperkaya = res_sinonim.json()['choices'][0]['message']['content'].strip()
+            res_medis = requests.post(url_groq, headers=headers_groq, json=payload_medis)
+            penyakit_medis_murni = res_medis.json()['choices'][0]['message']['content'].strip().lower()
         except:
-            # Fallback jika Groq penentu sinonim bermasalah, gunakan kata bawaan
-            keyword_diperkaya = clean_disease
+            penyakit_medis_murni = clean_disease
 
-        # 1. QUERY SEARCH KE PINECONE SERVERLESS INFERENCE
+        # Buat query internal ke Pinecone yang sangat spesifik, tanpa menyertakan kata umum "mata" jika bisa
+        # Contoh: jika "mata merah", query menjadi "clinical signs and treatment of conjunctivitis"
+        query_internal = f"Clinical signs, symptoms, image presentations, and treatment of {penyakit_medis_murni}."
+        
+        # 1. QUERY SEARCH KE PINECONE
         url_pinecone = f"{PINECONE_HOST}/query"
         headers_pc = {
             "Api-Key": PINECONE_API_KEY,
             "Content-Type": "application/json"
         }
         
-        # Query internal sekarang jauh lebih kaya, contoh: "... untuk penyakit bintitan hordeolum stye."
-        query_internal = f"Gejala, tanda klinis pada citra fundus/eksternal, dan penanganan medis untuk penyakit {keyword_diperkaya}."
-        
         payload_pc = {
             "inputs": query_internal,
-            "topK": max(top_k * 5, 15),  # Ditandai naik ke 15 agar peluang menyaring kecocokan metadata lebih besar
+            "topK": 20,  # Naikkan kandidat agar pencarian melimpah sebelum difilter
             "includeMetadata": True
         }
         
         res_pc = requests.post(url_pinecone, headers=headers_pc, json=payload_pc)
         data_pc = res_pc.json()
         
-        # 2. FILTERING METADATA PENYAKIT
+        # 2. FILTERING METADATA PENYAKIT (DIKETATKAN)
         retrieved_contexts = []
         rank_counter = 1
+        
+        # Pemetaan kata kunci alternatif untuk pengecekan teks dokumen
+        synonyms_map = {
+            "conjunctivitis": ["konjungtivitis", "conjunctivitis", "mata merah", "red eye"],
+            "hordeolum": ["hordeolum", "bintitan", "stye"],
+            "cataract": ["katarak", "cataract"],
+            "glaucoma": ["glaukoma", "glaucoma"],
+            "diabetic retinopathy": ["retinopati", "diabetic retinopathy", "retinopathy"]
+        }
+        
+        # Dapatkan list kata kunci berdasarkan penyakit terdeteksi
+        allowed_keywords = synonyms_map.get(penyakit_medis_murni, [penyakit_medis_murni, clean_disease])
         
         if "matches" in data_pc:
             for match in data_pc["matches"]:
@@ -124,12 +134,20 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
                 metadata_disease = metadata.get("disease", metadata.get("artifact", "")).lower()
                 metadata_text = normalize_label(metadata.get("text", ""))
                 
-                # Filter longgar & cerdas: lolos jika metadata disease cocok ATAU kata kunci diperkaya terkandung di dalam teks
+                # FILTER KETAT: 
+                # Dokumen lolos JIKA label metadatanya persis cocok dengan penyakit medis murni
+                # ATAU salah satu kata kunci spesifik (seperti konjungtivitis/bintitan) ada di dalam teks dokumen.
                 is_match = (
-                    metadata_disease == clean_disease or 
-                    clean_disease in metadata_text or 
-                    metadata_disease in keyword_diperkaya
+                    metadata_disease == penyakit_medis_murni or 
+                    metadata_disease == clean_disease or
+                    any(kw in metadata_text for kw in allowed_keywords)
                 )
+                
+                # JIKA terdeteksi kata kunci penyakit lain yang dominan, batalkan (Mencegah Hordeolum masuk ke Konjungtivitis)
+                if penyakit_medis_murni == "conjunctivitis" and "hordeolum" in metadata_text and "konjungtivitis" not in metadata_text:
+                    is_match = False
+                if penyakit_medis_murni == "hordeolum" and "conjunctivitis" in metadata_text and "hordeolum" not in metadata_text:
+                    is_match = False
                 
                 if is_match:
                     retrieved_contexts.append({
