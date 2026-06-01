@@ -11,19 +11,17 @@ CORS(app)
 # ==========================================
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
+PINECONE_HOST = os.environ.get("PINECONE_HOST")
 
-NAMA_INDEX = "vector-index-my"
-PINECONE_HOST = "https://vector-index-my-oxdsd3s.svc.aped-4627-b74a.pinecone.io"
-
-
-# Daftar penyakit mata yang valid dalam cakupan penelitian Anda
+# Daftar penyakit mata yang valid (Diperluas agar mencakup variasi istilah awam/medis)
 VALID_DISEASES = {
-    "normal", 
-    "katarak", 
-    "hordeolum", 
-    "conjunctivitis", 
-    "pterygium",
-    "uveitis"
+    "katarak", "cataract",
+    "glaukoma", "glaucoma",
+    "congjunctivitis", "konjungtivitis", "mata merah",
+    "uveitis",
+    "pterisium", "pterygium",
+    "hordeolum", "bintitan", "stye",
+    "normal"
 }
 
 def normalize_label(text: str) -> str:
@@ -60,36 +58,80 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
         }), 200
 
     try:
-        # 1. QUERY SEARCH KE PINECONE SERVERLESS INFERENCE (Menggunakan Pencarian Teks Langsung)
+        # =========================================================================
+        # TAMBAHAN TRICK: QUERY EXPANSION DENGAN GROQ SEBELUM KE PINECONE
+        # =========================================================================
+        # Hal ini mematangkan query agar memuat nama Medis (Latin/Inggris) sekaligus nama Awam (Indonesia)
+        url_groq = "https://api.groq.com/openai/v1/chat/completions"
+        headers_groq = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        prompt_sinonim = f"""
+        Tugas Anda adalah memberikan padanan nama penyakit mata dalam bentuk (Istilah Awam Indonesia dan Istilah Medis/Latin/Inggris).
+        Jangan berikan penjelasan panjang atau tanda baca, cukup berikan 2 sampai 3 kata kunci utama saja.
+        
+        Contoh:
+        Input: hordeolum -> Output: bintitan hordeolum stye
+        Input: bintitan -> Output: bintitan hordeolum stye
+        Input: cataract -> Output: katarak cataract
+        Input: mata merah -> Output: mata merah konjungtivitis conjunctivitis
+        
+        Input: {clean_disease}
+        Output:"""
+        
+        payload_sinonim = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [{"role": "user", "content": prompt_sinonim}],
+            "temperature": 0.1
+        }
+        
+        # Eksekusiasan perluasan kata kunci secara senyap (silent)
+        try:
+            res_sinonim = requests.post(url_groq, headers=headers_groq, json=payload_sinonim)
+            keyword_diperkaya = res_sinonim.json()['choices'][0]['message']['content'].strip()
+        except:
+            # Fallback jika Groq penentu sinonim bermasalah, gunakan kata bawaan
+            keyword_diperkaya = clean_disease
+
+        # 1. QUERY SEARCH KE PINECONE SERVERLESS INFERENCE
         url_pinecone = f"{PINECONE_HOST}/query"
         headers_pc = {
             "Api-Key": PINECONE_API_KEY,
             "Content-Type": "application/json"
         }
         
-        # Buat query penjelas otomatis untuk mengambil referensi klinis terdekat
-        query_internal = f"Gejala, tanda klinis pada citra fundus/eksternal, dan penanganan medis untuk penyakit {clean_disease}."
+        # Query internal sekarang jauh lebih kaya, contoh: "... untuk penyakit bintitan hordeolum stye."
+        query_internal = f"Gejala, tanda klinis pada citra fundus/eksternal, dan penanganan medis untuk penyakit {keyword_diperkaya}."
         
         payload_pc = {
             "inputs": query_internal,
-            "topK": max(top_k * 4, 10),  # Mengambil kandidat ekstra untuk penyaringan metadata penyakit
+            "topK": max(top_k * 5, 15),  # Ditandai naik ke 15 agar peluang menyaring kecocokan metadata lebih besar
             "includeMetadata": True
         }
         
         res_pc = requests.post(url_pinecone, headers=headers_pc, json=payload_pc)
         data_pc = res_pc.json()
         
-        # 2. FILTERING METADATA PENYAKIT (SAMA PERSIS DENGAN STANDAR KODE FASTAPI ANDA)
+        # 2. FILTERING METADATA PENYAKIT
         retrieved_contexts = []
         rank_counter = 1
         
         if "matches" in data_pc:
             for match in data_pc["matches"]:
                 metadata = match.get("metadata", {})
-                # Filter ketat: Memastikan potongan dokumen medis cocok dengan kelas penyakit hasil deteksi YOLOv8
                 metadata_disease = metadata.get("disease", metadata.get("artifact", "")).lower()
+                metadata_text = normalize_label(metadata.get("text", ""))
                 
-                if metadata_disease == clean_disease or clean_disease in normalize_label(metadata.get("text", "")):
+                # Filter longgar & cerdas: lolos jika metadata disease cocok ATAU kata kunci diperkaya terkandung di dalam teks
+                is_match = (
+                    metadata_disease == clean_disease or 
+                    clean_disease in metadata_text or 
+                    metadata_disease in keyword_diperkaya
+                )
+                
+                if is_match:
                     retrieved_contexts.append({
                         "rank": rank_counter,
                         "context": metadata.get("text", "Deskripsi medis tidak tersedia."),
@@ -122,11 +164,11 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
 
         # 4. SYSTEM PROMPT & USER PROMPT BERDASARKAN BAHASA
         if lang.lower() == "en":
-            system_msg = """You are an expert AI Ophthalmologist Assistant.
+            system_msg = """You are an expert AI Ophthalmology Assistant.
 RULES:
 - Provide a clinical interpretation strictly based on the provided Retrieved Contexts and YOLOv8 detection results.
 - Maximum 2 paragraphs. Use professional and formal medical terminology.
-- If the context is completely irrelevant, rely on standard ophthalmology guidelines for the detected disease."""
+- Always clarify both lay terms and formal medical names side by side (e.g., Stye/Hordeolum)."""
             
             prompt = f"""[DETECTION RESULT]
 Detected Disease: {nama_penyakit}
@@ -137,28 +179,23 @@ Confidence Score: {nilai_confidence}
 
 TASK: Explain the condition, how it presents visually on eye images, and the recommended next clinical steps."""
         else:
-            system_msg = """Anda adalah sistem AI Asisten Dokter Spesialis Mata yang sangat profesional.
+            system_msg = """Anda adalah sistem AI Asisten Dokter Spesialis Mata yang sangat profesional namun ramah terhadap pasien awam.
 ATURAN:
-- Berikan interpretasi klinis dan langkah penanganan medis berdasarkan hasil deteksi sistem YOLOv8 dan dokumen referensi medis terpercaya yang disediakan.
+- Berikan interpretasi klinis dan langkah penanganan medis berdasarkan hasil deteksi sistem YOLOv8 dan dokumen referensi medis terpercaya yang disediakan (bisa dalam teks bahasa Indonesia maupun bahasa Inggris).
 - Sampaikan jawaban dalam Bahasa Indonesia medis yang formal, jelas, dan terstruktur.
+- Anda WAJIB menyandingkan istilah awam Indonesia (seperti Bintitan) dengan istilah medis resminya (Hordeolum) agar pasien paham.
 - Jawaban maksimal 2 paragraf."""
             
             prompt = f"""[HASIL DETEKSI YOLOv8]
 Penyakit Terdeteksi: {nama_penyakit}
 Tingkat Keyakinan (Confidence): {nilai_confidence}
 
-[DOKUMEN REFERENSI MEDIS]
+[DOKUMEN REFERENSI MEDIS (BILINGUAL INDO/ENG)]
 {combined_context}
 
-TUGAS: Jelaskan gambaran patologis penyakit tersebut pada citra mata, serta berikan rekomendasi tindakan medis awal atau rujukan yang harus dilakukan oleh pasien."""
+TUGAS: Jelaskan gambaran patologis penyakit tersebut pada citra mata, sebutkan nama awam beserta nama ilmiah medisnya, serta berikan rekomendasi tindakan medis awal atau rujukan yang harus dilakukan oleh pasien."""
 
         # 5. GENERATE GENERASI TEKS VIA GROQ CLOUD API (Llama 3.1)
-        url_groq = "https://api.groq.com/openai/v1/chat/completions"
-        headers_groq = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
         payload_groq = {
             "model": "llama-3.1-8b-instant",
             "messages": [
@@ -174,7 +211,7 @@ TUGAS: Jelaskan gambaran patologis penyakit tersebut pada citra mata, serta beri
         hasil_interpretasi = data_groq['choices'][0]['message']['content']
         first_context = retrieved_contexts[0]
 
-        # 6. JSON RETURN (SAMA PERSIS DENGAN SKEMA OUTPUT FASTAPI TA ANDA)
+        # 6. JSON RETURN
         return jsonify({
             "disease_name": nama_penyakit,
             "confidence": nilai_confidence,
@@ -216,7 +253,6 @@ def generate_interpretation():
 # ==========================================
 @app.route('/get-info', methods=['GET'])
 def get_info():
-    # Mengambil parameter dari URL query string (?artefak=Katarak atau ?penyakit=Katarak)
     penyakit_query = request.args.get('penyakit', request.args.get('artefak', 'Katarak'))
     lang = request.args.get('lang', 'id')
     try:
