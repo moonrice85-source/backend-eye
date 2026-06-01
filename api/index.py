@@ -13,14 +13,14 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_HOST = os.environ.get("PINECONE_HOST")
 
-# Daftar penyakit mata yang valid (Diperluas agar mencakup variasi istilah awam/medis)
+# Daftar penyakit mata yang VALID & DIKUNCI sesuai fokus penelitian Anda
 VALID_DISEASES = {
+    "normal",
     "katarak", "cataract",
-    "congjunctivitis", "konjungtivitis", "mata merah",
-    "uveitis",
-    "pterisium", "pterygium",
-    "hordeolum", "bintitan", "stye",
-    "normal"
+    "konjungtivitis", "mata merah", "conjunctivitis",
+    "uveitis", "radang uvea",
+    "pterygium", "pterisium",
+    "hordeolum", "bintitan", "stye"
 }
 
 def normalize_label(text: str) -> str:
@@ -38,6 +38,13 @@ def normalize_label(text: str) -> str:
 def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k: int = 3):
     clean_disease = normalize_label(nama_penyakit)
     
+    # Validasi input: Jika penyakit tidak terdaftar dalam ruang lingkup penelitian
+    if clean_disease not in VALID_DISEASES:
+        return jsonify({
+            "status": "error",
+            "message": f"Penyakit '{nama_penyakit}' di luar ruang lingkup cakupan penelitian mata."
+        }), 400
+
     # Kondisi Khusus: Jika YOLOv8 mendeteksi mata "Normal"
     if clean_disease == "normal":
         msg_normal = (
@@ -47,7 +54,7 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
         )
         return jsonify({
             "status": "success",
-            "disease_name": nama_penyakit,
+            "disease_name": "Normal",
             "confidence": nilai_confidence,
             "retrieved_context": "N/A (Patient is Normal)",
             "page": None,
@@ -58,97 +65,88 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
 
     try:
         # =========================================================================
-        # STRATEGI BARU: AMBIL 1 NAMA MEDIS UTAMA & KATA KUNCI PENCARIAN SEPARASI
+        # MAPPING METADATA KETAT (HANYA 5 PENYAKIT AKTIF)
         # =========================================================================
-        url_groq = "https://api.groq.com/openai/v1/chat/completions"
-        headers_groq = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
+        disease_map = {
+            "katarak": "katarak",
+            "cataract": "katarak",
+            "konjungtivitis": "konjungtivitis",
+            "mata merah": "konjungtivitis",
+            "conjunctivitis": "konjungtivitis",
+            "uveitis": "uveitis",
+            "radang uvea": "uveitis",
+            "pterygium": "pterygium",
+            "pterisium": "pterygium",
+            "hordeolum": "hordeolum",
+            "bintitan": "hordeolum",
+            "stye": "hordeolum"
         }
         
-        # Prompt ini memaksa Groq hanya memberikan SATU istilah medis utama untuk filter ketat
-        prompt_medis_murni = f"""
-        Sebutkan HANYA SATU nama istilah medis/ilmiah resmi (dalam bahasa Inggris atau Latin) untuk penyakit mata berikut: {clean_disease}.
-        Jangan berikan tanda baca, jangan ada kata lain, cukup nama penyakitnya saja.
-        
-        Contoh:
-        Input: bintitan -> Output: hordeolum
-        Input: mata merah -> Output: conjunctivitis
-        Input: katarak -> Output: cataract
-        
-        Input: {clean_disease}
-        Output:"""
-        
-        payload_medis = {
-            "model": "llama-3.1-8b-instant",
-            "messages": [{"role": "user", "content": prompt_medis_murni}],
-            "temperature": 0.1
-        }
-        
-        try:
-            res_medis = requests.post(url_groq, headers=headers_groq, json=payload_medis)
-            penyakit_medis_murni = res_medis.json()['choices'][0]['message']['content'].strip().lower()
-        except:
-            penyakit_medis_murni = clean_disease
+        target_metadata_disease = disease_map.get(clean_disease, clean_disease)
 
-        # Buat query internal ke Pinecone yang sangat spesifik, tanpa menyertakan kata umum "mata" jika bisa
-        # Contoh: jika "mata merah", query menjadi "clinical signs and treatment of conjunctivitis"
-        query_internal = f"Clinical signs, symptoms, image presentations, and treatment of {penyakit_medis_murni}."
-        
-        # 1. QUERY SEARCH KE PINECONE
+        # 1. QUERY SEARCH KE PINECONE DENGAN METADATA FILTER KETAT
         url_pinecone = f"{PINECONE_HOST}/query"
         headers_pc = {
             "Api-Key": PINECONE_API_KEY,
             "Content-Type": "application/json"
         }
         
+        query_internal = f"Clinical signs, symptoms, visual presentation, and medical treatment for {target_metadata_disease}."
+        
         payload_pc = {
             "inputs": query_internal,
-            "topK": 20,  # Naikkan kandidat agar pencarian melimpah sebelum difilter
-            "includeMetadata": True
+            "topK": top_k,  
+            "includeMetadata": True,
+            "filter": {
+                "disease": {"$eq": target_metadata_disease} # Mengunci target penyakit di Pinecone
+            }
         }
         
         res_pc = requests.post(url_pinecone, headers=headers_pc, json=payload_pc)
         data_pc = res_pc.json()
         
-        # 2. FILTERING METADATA PENYAKIT (DIKETATKAN)
+        # Fallback nama kolom metadata sekunder jika Anda menggunakan nama "artifact"
+        if "matches" not in data_pc or len(data_pc["matches"]) == 0:
+            payload_pc["filter"] = {"artifact": {"$eq": target_metadata_disease}}
+            res_pc = requests.post(url_pinecone, headers=headers_pc, json=payload_pc)
+            data_pc = res_pc.json()
+            
+        # 2. PROSES EXTRACTION CONTEXT
         retrieved_contexts = []
         rank_counter = 1
         
-        # Pemetaan kata kunci alternatif untuk pengecekan teks dokumen
-        synonyms_map = {
-            "conjunctivitis": ["konjungtivitis", "conjunctivitis", "mata merah", "red eye"],
-            "hordeolum": ["hordeolum", "bintitan", "stye"],
-            "cataract": ["katarak", "cataract"],
-            "glaucoma": ["glaukoma", "glaucoma"],
-            "diabetic retinopathy": ["retinopati", "diabetic retinopathy", "retinopathy"]
-        }
-        
-        # Dapatkan list kata kunci berdasarkan penyakit terdeteksi
-        allowed_keywords = synonyms_map.get(penyakit_medis_murni, [penyakit_medis_murni, clean_disease])
-        
-        if "matches" in data_pc:
+        if "matches" in data_pc and len(data_pc["matches"]) > 0:
             for match in data_pc["matches"]:
                 metadata = match.get("metadata", {})
-                metadata_disease = metadata.get("disease", metadata.get("artifact", "")).lower()
-                metadata_text = normalize_label(metadata.get("text", ""))
-                
-                # FILTER KETAT: 
-                # Dokumen lolos JIKA label metadatanya persis cocok dengan penyakit medis murni
-                # ATAU salah satu kata kunci spesifik (seperti konjungtivitis/bintitan) ada di dalam teks dokumen.
-                is_match = (
-                    metadata_disease == penyakit_medis_murni or 
-                    metadata_disease == clean_disease or
-                    any(kw in metadata_text for kw in allowed_keywords)
-                )
-                
-                # JIKA terdeteksi kata kunci penyakit lain yang dominan, batalkan (Mencegah Hordeolum masuk ke Konjungtivitis)
-                if penyakit_medis_murni == "conjunctivitis" and "hordeolum" in metadata_text and "konjungtivitis" not in metadata_text:
-                    is_match = False
-                if penyakit_medis_murni == "hordeolum" and "conjunctivitis" in metadata_text and "hordeolum" not in metadata_text:
-                    is_match = False
-                
-                if is_match:
+                retrieved_contexts.append({
+                    "rank": rank_counter,
+                    "context": metadata.get("text", "Deskripsi medis tidak tersedia."),
+                    "page": metadata.get("page", 1),
+                    "paragraph": metadata.get("paragraph", 1),
+                    "chunk_index": metadata.get("chunk_index", rank_counter),
+                    "similarity_score": float(match.get("score", 0.0))
+                })
+                rank_counter += 1
+        
+        # Proteksi Fallback Code-Side (Bila database tidak merespon filter metadata secara tepat)
+        if not retrieved_contexts:
+            payload_back = {"inputs": query_internal, "topK": top_k + 5, "includeMetadata": True}
+            res_pc_back = requests.post(url_pinecone, headers=headers_pc, json=payload_back)
+            data_pc_back = res_pc_back.json()
+            
+            if "matches" in data_pc_back:
+                for match in data_pc_back["matches"]:
+                    metadata = match.get("metadata", {})
+                    metadata_text = metadata.get("text", "").lower()
+                    
+                    # Logika isolasi ketat antar kelas penyakit yang rentan tertukar
+                    if target_metadata_disease == "konjungtivitis" and "hordeolum" in metadata_text and "konjungtivitis" not in metadata_text:
+                        continue 
+                    if target_metadata_disease == "hordeolum" and "conjunctivitis" in metadata_text and "hordeolum" not in metadata_text:
+                        continue
+                    if target_metadata_disease == "uveitis" and "konjungtivitis" in metadata_text and "uveitis" not in metadata_text:
+                        continue
+                        
                     retrieved_contexts.append({
                         "rank": rank_counter,
                         "context": metadata.get("text", "Deskripsi medis tidak tersedia."),
@@ -158,34 +156,38 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
                         "similarity_score": float(match.get("score", 0.0))
                     })
                     rank_counter += 1
-                
-                if len(retrieved_contexts) >= top_k:
-                    break
+                    if len(retrieved_contexts) >= top_k:
+                        break
 
-        # Fallback jika tidak ada chunk yang lolos filter metadata
         if not retrieved_contexts:
             retrieved_contexts.append({
                 "rank": 1,
-                "context": f"Gunakan pengetahuan medis umum terkait tata laksana penyakit {nama_penyakit}.",
+                "context": f"Gunakan pengetahuan medis umum terkait tata laksana penyakit {target_metadata_disease}.",
                 "page": 1,
                 "paragraph": 1,
                 "chunk_index": 1,
                 "similarity_score": 0.50
             })
 
-        # 3. PENGGABUNGAN KONTEKS UNTUK PROMPT LLM
+        # 3. CONTEXT COMBINATION
         combined_context = "\n\n".join([
             f"[Referensi {item['rank']} | Halaman Buku {item['page']} | Paragraf {item['paragraph']}]\n{item['context']}"
             for item in retrieved_contexts
         ])
 
-        # 4. SYSTEM PROMPT & USER PROMPT BERDASARKAN BAHASA
+        # 4. SET UP BILINGUAL PROMPT DENGAN PROTEKSI 6 KELAS FOKUS
+        url_groq = "https://api.groq.com/openai/v1/chat/completions"
+        headers_groq = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
         if lang.lower() == "en":
             system_msg = """You are an expert AI Ophthalmology Assistant.
 RULES:
 - Provide a clinical interpretation strictly based on the provided Retrieved Contexts and YOLOv8 detection results.
 - Maximum 2 paragraphs. Use professional and formal medical terminology.
-- Always clarify both lay terms and formal medical names side by side (e.g., Stye/Hordeolum)."""
+- Explicitly pair lay terms and formal medical terms side by side (e.g., Stye/Hordeolum, Red Eye/Conjunctivitis, Cataract, Uveitis, or Pterygium)."""
             
             prompt = f"""[DETECTION RESULT]
 Detected Disease: {nama_penyakit}
@@ -200,7 +202,7 @@ TASK: Explain the condition, how it presents visually on eye images, and the rec
 ATURAN:
 - Berikan interpretasi klinis dan langkah penanganan medis berdasarkan hasil deteksi sistem YOLOv8 dan dokumen referensi medis terpercaya yang disediakan (bisa dalam teks bahasa Indonesia maupun bahasa Inggris).
 - Sampaikan jawaban dalam Bahasa Indonesia medis yang formal, jelas, dan terstruktur.
-- Anda WAJIB menyandingkan istilah awam Indonesia (seperti Bintitan) dengan istilah medis resminya (Hordeolum) agar pasien paham.
+- Anda WAJIB menyandingkan istilah awam Indonesia dengan istilah medis resminya (contoh: Bintitan/Hordeolum, Mata Merah/Konjungtivitis, Katarak, Uveitis, atau Pterygium) agar pasien langsung paham.
 - Jawaban maksimal 2 paragraf."""
             
             prompt = f"""[HASIL DETEKSI YOLOv8]
@@ -212,7 +214,7 @@ Tingkat Keyakinan (Confidence): {nilai_confidence}
 
 TUGAS: Jelaskan gambaran patologis penyakit tersebut pada citra mata, sebutkan nama awam beserta nama ilmiah medisnya, serta berikan rekomendasi tindakan medis awal atau rujukan yang harus dilakukan oleh pasien."""
 
-        # 5. GENERATE GENERASI TEKS VIA GROQ CLOUD API (Llama 3.1)
+        # 5. GENERATE INTERPRETASI VIA GROQ CLOUD
         payload_groq = {
             "model": "llama-3.1-8b-instant",
             "messages": [
@@ -228,7 +230,7 @@ TUGAS: Jelaskan gambaran patologis penyakit tersebut pada citra mata, sebutkan n
         hasil_interpretasi = data_groq['choices'][0]['message']['content']
         first_context = retrieved_contexts[0]
 
-        # 6. JSON RETURN
+        # 6. JSON RETURN UNTUK FLUTTER / ANDROID STUDIO
         return jsonify({
             "disease_name": nama_penyakit,
             "confidence": nilai_confidence,
@@ -249,7 +251,7 @@ TUGAS: Jelaskan gambaran patologis penyakit tersebut pada citra mata, sebutkan n
         return jsonify({"status": "error", "message": error_msg}), 500
 
 # ==========================================
-# ROUTE 1: UNTUK KONEKSI ANDROID STUDIO (POST)
+# ENDPOINT POST & GET
 # ==========================================
 @app.route('/generate-interpretation', methods=['POST'])
 def generate_interpretation():
@@ -265,9 +267,6 @@ def generate_interpretation():
         
     return process_eye_rag(nama_penyakit=data['penyakit'], nilai_confidence=data['confidence'], lang=lang, top_k=top_k)
 
-# ==========================================
-# ROUTE 2: UNTUK UJI COBA INSTAN VIA BROWSER (GET)
-# ==========================================
 @app.route('/get-info', methods=['GET'])
 def get_info():
     penyakit_query = request.args.get('penyakit', request.args.get('artefak', 'Katarak'))
@@ -281,4 +280,4 @@ def get_info():
 
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "active", "message": "Sistem RAG Diagnosa Penyakit Mata Aktif (Serverless Mode)."})
+    return jsonify({"status": "active", "message": "Sistem RAG 6 Kelas Diagnosa Mata Aktif."})
