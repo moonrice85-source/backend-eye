@@ -16,7 +16,6 @@ PINECONE_HOST = os.environ.get("PINECONE_HOST")
 # Daftar penyakit mata yang valid (Diperluas agar mencakup variasi istilah awam/medis)
 VALID_DISEASES = {
     "katarak", "cataract",
-    "glaukoma", "glaucoma",
     "congjunctivitis", "konjungtivitis", "mata merah",
     "uveitis",
     "pterisium", "pterygium",
