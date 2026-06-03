@@ -13,7 +13,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_HOST = os.environ.get("PINECONE_HOST")
 
-# Daftar penyakit mata yang VALID & DIKUNCI sesuai fokus penelitian Anda
+# Daftar penyakit mata yang VALID & DIKUNCI sesuai fokus penelitian
 VALID_DISEASES = {
     "normal",
     "katarak", "cataract",
@@ -64,9 +64,7 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
         }), 200
 
     try:
-        # =========================================================================
-        # MAPPING METADATA KETAT (HANYA 5 PENYAKIT AKTIF)
-        # =========================================================================
+        # MAPPING METADATA KETAT
         disease_map = {
             "katarak": "katarak",
             "cataract": "katarak",
@@ -84,7 +82,7 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
         
         target_metadata_disease = disease_map.get(clean_disease, clean_disease)
 
-        # 1. QUERY SEARCH KE PINECONE DENGAN METADATA FILTER KETAT
+        # 1. QUERY SEARCH KE PINECONE (MENGGUNAKAN INTEGRATED EMBEDDING CLOUD PINECONE)
         url_pinecone = f"{PINECONE_HOST}/query"
         headers_pc = {
             "Api-Key": PINECONE_API_KEY,
@@ -93,12 +91,13 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
         
         query_internal = f"Clinical signs, symptoms, visual presentation, and medical treatment for {target_metadata_disease}."
         
+        # Payload disesuaikan agar teks mentah diproses langsung oleh model embedding cloud Pinecone
         payload_pc = {
-            "inputs": query_internal,
+            "inputs": {"text": query_internal},  
             "topK": top_k,  
             "includeMetadata": True,
             "filter": {
-                "disease": {"$eq": target_metadata_disease} # Mengunci target penyakit di Pinecone
+                "disease": {"$eq": target_metadata_disease} 
             }
         }
         
@@ -130,7 +129,7 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
         
         # Proteksi Fallback Code-Side (Bila database tidak merespon filter metadata secara tepat)
         if not retrieved_contexts:
-            payload_back = {"inputs": query_internal, "topK": top_k + 5, "includeMetadata": True}
+            payload_back = {"inputs": {"text": query_internal}, "topK": top_k + 5, "includeMetadata": True}
             res_pc_back = requests.post(url_pinecone, headers=headers_pc, json=payload_back)
             data_pc_back = res_pc_back.json()
             
@@ -175,7 +174,7 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
             for item in retrieved_contexts
         ])
 
-        # 4. SET UP BILINGUAL PROMPT DENGAN PROTEKSI 6 KELAS FOKUS
+        # 4. SET UP BILINGUAL PROMPT DENGAN PROTEKSI FOKUS KELAS
         url_groq = "https://api.groq.com/openai/v1/chat/completions"
         headers_groq = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -251,7 +250,7 @@ TUGAS: Jelaskan gambaran patologis penyakit tersebut pada citra mata, sebutkan n
         return jsonify({"status": "error", "message": error_msg}), 500
 
 # ==========================================
-# ENDPOINT POST & GET
+# ENDPOINT POST & GET (UNTUK KELAS INFERENSI)
 # ==========================================
 @app.route('/generate-interpretation', methods=['POST'])
 def generate_interpretation():
@@ -278,6 +277,72 @@ def get_info():
         
     return process_eye_rag(nama_penyakit=penyakit_query, nilai_confidence="98.50%", lang=lang, top_k=top_k)
 
+
+# ==========================================
+# ENDPOINT BARU: FITUR INTERAKTIF CHAT MATA
+# ==========================================
+@app.route('/chat', methods=['POST'])
+def chat_mata():
+    data = request.json
+    if not data or 'message' not in data:
+        return jsonify({"status": "error", "message": "Pesan dari user tidak boleh kosong."}), 400
+    
+    user_message = data.get('message')
+    # Menerima rekaman riwayat percakapan dari aplikasi mobile
+    chat_history = data.get('history', []) 
+    lang = data.get('lang', 'id')
+    
+    # 1. Konfigurasi System Prompt Utama untuk Chatbot
+    if lang.lower() == "en":
+        system_msg = """You are a helpful, professional, and friendly AI Ophthalmology Assistant. 
+        Answer the patient's questions clearly based on general medical eye health knowledge. 
+        Keep your advice safe, responsible, and easy to understand."""
+    else:
+        system_msg = """Anda adalah AI Asisten Dokter Spesialis Mata yang ramah, sopan, dan profesional. 
+        Jawablah pertanyaan pengguna atau pasien mengenai keluhan atau kesehatan mata mereka dengan penjelasan yang mudah dimengerti. 
+        Gunakan bahasa Indonesia yang santun dan informatif. 
+        Selalu ingatkan pasien untuk melakukan pemeriksaan langsung ke dokter spesialis mata jika gejala dirasa mengkhawatirkan atau memburuk."""
+
+    # 2. Susun Struktur Chat Sesuai Format Groq/OpenAI (Memasukkan History)
+    messages = [{"role": "system", "content": system_msg}]
+    
+    # Looping history yang dikirim dari mobile UI ke dalam pesan Chat Completions
+    for chat in chat_history:
+        messages.append({"role": chat['role'], "content": chat['content']})
+        
+    # Masukkan chat terupdate dari user di akhir array
+    messages.append({"role": "user", "content": user_message})
+    
+    try:
+        # 3. Tembak Data Ke API Groq
+        url_groq = "https://api.groq.com/openai/v1/chat/completions"
+        headers_groq = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload_groq = {
+            "model": "llama-3.1-8b-instant",
+            "messages": messages,
+            "temperature": 0.4  
+        }
+        
+        res_groq = requests.post(url_groq, headers=headers_groq, json=payload_groq)
+        data_groq = res_groq.json()
+        
+        reply_ai = data_groq['choices'][0]['message']['content']
+        
+        return jsonify({
+            "status": "success",
+            "reply": reply_ai
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({"status": "active", "message": "Sistem RAG 6 Kelas Diagnosa Mata Aktif."})
+    return jsonify({"status": "active", "message": "Sistem RAG & Fitur Chat 6 Kelas Diagnosa Mata Aktif."})
+
+if __name__ == '__main__':
+    app.run(debug=True)
