@@ -2,6 +2,8 @@ import os
 import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+# === TAMBAHKAN LIBRARY UTAMA ROBOFLOW ===
+from inference_sdk import InferenceHTTPClient
 
 app = Flask(__name__)
 CORS(app)
@@ -12,6 +14,14 @@ CORS(app)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY")
 PINECONE_HOST = os.environ.get("PINECONE_HOST")
+# Tambahkan kredensial API Key Roboflow dari environment variable
+ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY", "BYkWLcOi0NyoYAIayr4Q")
+
+# Inisialisasi Client Inference Roboflow Serverless (Sangat ringan & Hemat RAM Vercel)
+ROBOFLOW_CLIENT = InferenceHTTPClient(
+    api_url="https://serverless.roboflow.com",
+    api_key=ROBOFLOW_API_KEY
+)
 
 # Daftar penyakit mata yang VALID & DIKUNCI sesuai fokus penelitian
 VALID_DISEASES = {
@@ -91,7 +101,6 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
         
         query_internal = f"Clinical signs, symptoms, visual presentation, and medical treatment for {target_metadata_disease}."
         
-        # Payload disesuaikan agar teks mentah diproses langsung oleh model embedding cloud Pinecone
         payload_pc = {
             "inputs": {"text": query_internal},  
             "topK": top_k,  
@@ -104,7 +113,6 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
         res_pc = requests.post(url_pinecone, headers=headers_pc, json=payload_pc)
         data_pc = res_pc.json()
         
-        # Fallback nama kolom metadata sekunder jika Anda menggunakan nama "artifact"
         if "matches" not in data_pc or len(data_pc["matches"]) == 0:
             payload_pc["filter"] = {"artifact": {"$eq": target_metadata_disease}}
             res_pc = requests.post(url_pinecone, headers=headers_pc, json=payload_pc)
@@ -127,7 +135,6 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
                 })
                 rank_counter += 1
         
-        # Proteksi Fallback Code-Side (Bila database tidak merespon filter metadata secara tepat)
         if not retrieved_contexts:
             payload_back = {"inputs": {"text": query_internal}, "topK": top_k + 5, "includeMetadata": True}
             res_pc_back = requests.post(url_pinecone, headers=headers_pc, json=payload_back)
@@ -138,7 +145,6 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
                     metadata = match.get("metadata", {})
                     metadata_text = metadata.get("text", "").lower()
                     
-                    # Logika isolasi ketat antar kelas penyakit yang rentan tertukar
                     if target_metadata_disease == "konjungtivitis" and "hordeolum" in metadata_text and "konjungtivitis" not in metadata_text:
                         continue 
                     if target_metadata_disease == "hordeolum" and "conjunctivitis" in metadata_text and "hordeolum" not in metadata_text:
@@ -174,7 +180,7 @@ def process_eye_rag(nama_penyakit: str, nilai_confidence: str, lang: str, top_k:
             for item in retrieved_contexts
         ])
 
-        # 4. SET UP BILINGUAL PROMPT DENGAN PROTEKSI FOKUS KELAS
+        # 4. SET UP BILINGUAL PROMPT
         url_groq = "https://api.groq.com/openai/v1/chat/completions"
         headers_groq = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -231,6 +237,7 @@ TUGAS: Jelaskan gambaran patologis penyakit tersebut pada citra mata, sebutkan n
 
         # 6. JSON RETURN UNTUK FLUTTER / ANDROID STUDIO
         return jsonify({
+            "status": "success",
             "disease_name": nama_penyakit,
             "confidence": nilai_confidence,
             "top_k": top_k,
@@ -249,22 +256,60 @@ TUGAS: Jelaskan gambaran patologis penyakit tersebut pada citra mata, sebutkan n
             error_msg += f" | Detail Groq: {data_groq}"
         return jsonify({"status": "error", "message": error_msg}), 500
 
+
 # ==========================================
-# ENDPOINT POST & GET (UNTUK KELAS INFERENSI)
+# PERUBAHAN BESAR: ENDPOINT DETEKSI GAMBAR REAL-TIME
 # ==========================================
 @app.route('/generate-interpretation', methods=['POST'])
 def generate_interpretation():
-    data = request.json
-    if not data or 'penyakit' not in data or 'confidence' not in data:
-        return jsonify({"status": "error", "message": "Format request salah. Butuh 'penyakit' dan 'confidence'"}), 400
+    # 1. Validasi apakah ada file gambar yang dikirim dari Android
+    if 'image' not in request.files:
+        return jsonify({"status": "error", "message": "Format request salah. Dibutuhkan file 'image'"}), 400
+        
+    image_file = request.files['image']
+    lang = request.form.get('lang', 'id')
     
-    lang = data.get('lang', 'id')
     try:
-        top_k = int(data.get('k', 3))
+        top_k = int(request.form.get('k', 3))
     except:
         top_k = 3
         
-    return process_eye_rag(nama_penyakit=data['penyakit'], nilai_confidence=data['confidence'], lang=lang, top_k=top_k)
+    temp_path = ""
+    try:
+        # 2. Simpan gambar sementara di direktori aman Vercel /tmp
+        temp_path = os.path.join("/tmp", image_file.filename)
+        image_file.save(temp_path)
+
+        # 3. Jalankan Inferensi ke Serverless Roboflow menggunakan Model Versi 3 milikmu
+        # Proses deteksi gambar berjalan kilat di GPU Cloud Roboflow
+        roboflow_result = ROBOFLOW_CLIENT.infer(temp_path, model_id="my-first-project-cu04s/3")
+        
+        # Hapus file gambar di /tmp segera setelah selesai diproses agar server tidak penuh
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+        # 4. Ekstraksi Hasil Prediksi dari JSON Roboflow
+        predictions = roboflow_result.get("predictions", [])
+        
+        if not predictions:
+            # Jika tidak mendeteksi objek penyakit apapun, asumsikan kondisi mata Normal
+            disease_name = "normal"
+            confidence_value = "100%"
+        else:
+            # Ambil objek deteksi dengan confidence score tertinggi (indeks 0)
+            top_prediction = predictions[0]
+            disease_name = top_prediction["class"]
+            confidence_value = f"{top_prediction['confidence'] * 100:.2f}%"
+            
+        # 5. Teruskan Nama Penyakit & Score hasil deteksi otomatis ke alur RAG Pinecone
+        return process_eye_rag(nama_penyakit=disease_name, nilai_confidence=confidence_value, lang=lang, top_k=top_k)
+
+    except Exception as e:
+        # Penanganan darurat pembersihan file jika di tengah jalan terjadi error
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+        return jsonify({"status": "error", "message": f"Gagal memproses gambar pada sisi server: {str(e)}"}), 500
+
 
 @app.route('/get-info', methods=['GET'])
 def get_info():
@@ -279,7 +324,7 @@ def get_info():
 
 
 # ==========================================
-# ENDPOINT BARU: FITUR INTERAKTIF CHAT MATA
+# ENDPOINT: FITUR INTERAKTIF CHAT MATA
 # ==========================================
 @app.route('/chat', methods=['POST'])
 def chat_mata():
@@ -288,11 +333,9 @@ def chat_mata():
         return jsonify({"status": "error", "message": "Pesan dari user tidak boleh kosong."}), 400
     
     user_message = data.get('message')
-    # Menerima rekaman riwayat percakapan dari aplikasi mobile
     chat_history = data.get('history', []) 
     lang = data.get('lang', 'id')
     
-    # 1. Konfigurasi System Prompt Utama untuk Chatbot
     if lang.lower() == "en":
         system_msg = """You are a helpful, professional, and friendly AI Ophthalmology Assistant. 
         Answer the patient's questions clearly based on general medical eye health knowledge. 
@@ -303,18 +346,14 @@ def chat_mata():
         Gunakan bahasa Indonesia yang santun dan informatif. 
         Selalu ingatkan pasien untuk melakukan pemeriksaan langsung ke dokter spesialis mata jika gejala dirasa mengkhawatirkan atau memburuk."""
 
-    # 2. Susun Struktur Chat Sesuai Format Groq/OpenAI (Memasukkan History)
     messages = [{"role": "system", "content": system_msg}]
     
-    # Looping history yang dikirim dari mobile UI ke dalam pesan Chat Completions
     for chat in chat_history:
         messages.append({"role": chat['role'], "content": chat['content']})
         
-    # Masukkan chat terupdate dari user di akhir array
     messages.append({"role": "user", "content": user_message})
     
     try:
-        # 3. Tembak Data Ke API Groq
         url_groq = "https://api.groq.com/openai/v1/chat/completions"
         headers_groq = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
